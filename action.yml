@@ -1,0 +1,64 @@
+name: "Network Policy Enforcer"
+description: "Monitor and block outbound network connections using Cilium Tetragon"
+
+inputs:
+  mode:
+    description: "Operating mode: 'audit' (observe only) or 'block' (enforce allowed domains)"
+    required: true
+  allowed-domains:
+    description: "Inline list of allowed hostnames (one per line). Ignored if allowed-domains-file is set."
+    required: false
+    default: ""
+  allowed-domains-file:
+    description: "Path to a file containing allowed domains (one per line). Takes precedence over allowed-domains."
+    required: false
+    default: ""
+  policy-file:
+    description: "Path where audit mode writes the generated policy file."
+    required: false
+    default: "network-policy.txt"
+  tetragon-version:
+    description: "Version of Cilium Tetragon to install"
+    required: false
+    default: "v1.3.0"
+  phase:
+    description: "Which phase to run: 'setup' (start monitoring) or 'report' (generate report and tear down). Users must call both."
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    - name: Make scripts executable
+      shell: bash
+      run: |
+        chmod +x "${{ github.action_path }}/scripts/setup.sh"
+        chmod +x "${{ github.action_path }}/scripts/monitor.sh"
+        chmod +x "${{ github.action_path }}/scripts/dns-monitor.sh"
+        chmod +x "${{ github.action_path }}/scripts/report.sh"
+        chmod +x "${{ github.action_path }}/scripts/teardown.sh"
+
+    - name: Setup Tetragon and apply policy
+      if: inputs.phase == 'setup'
+      shell: bash
+      env:
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_ALLOWED_DOMAINS: ${{ inputs.allowed-domains }}
+        INPUT_ALLOWED_DOMAINS_FILE: ${{ inputs.allowed-domains-file }}
+        INPUT_POLICY_FILE: ${{ inputs.policy-file }}
+        INPUT_TETRAGON_VERSION: ${{ inputs.tetragon-version }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: "${{ github.action_path }}/scripts/setup.sh"
+
+    - name: Generate report and teardown
+      if: inputs.phase == 'report'
+      shell: bash
+      env:
+        INPUT_MODE: ${{ inputs.mode }}
+        INPUT_ALLOWED_DOMAINS: ${{ inputs.allowed-domains }}
+        INPUT_ALLOWED_DOMAINS_FILE: ${{ inputs.allowed-domains-file }}
+        INPUT_POLICY_FILE: ${{ inputs.policy-file }}
+        INPUT_TETRAGON_VERSION: ${{ inputs.tetragon-version }}
+        ACTION_PATH: ${{ github.action_path }}
+      run: |
+        "${{ github.action_path }}/scripts/report.sh"
+        "${{ github.action_path }}/scripts/teardown.sh"

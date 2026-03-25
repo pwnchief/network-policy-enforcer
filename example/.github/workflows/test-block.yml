@@ -1,0 +1,41 @@
+name: "Test Network Policy Enforcer - Block Mode"
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  block-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Network Policy Enforcer
+        uses: pwnchief/network-policy-enforcer@v1
+        with:
+          mode: block
+          phase: setup
+          allowed-domains: |
+            github.com
+            pypi.org
+            files.pythonhosted.org
+
+      - name: Fetch allowed domain
+        id: fetch-allowed
+        run: curl -s https://github.com > /dev/null
+
+      - name: Install pip package
+        id: pip-install
+        run: pip install requests || true
+
+      - name: Report and teardown
+        if: always()
+        uses: pwnchief/network-policy-enforcer@v1
+        with:
+          mode: block
+          phase: report
+          allowed-domains: |
+            github.com
+            pypi.org
+            files.pythonhosted.org

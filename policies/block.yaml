@@ -1,0 +1,22 @@
+# Block-mode TracingPolicy
+#
+# NOTE: Tetragon's built-in allowlisting for network destinations operates on
+# IP CIDRs, not hostnames. Because allowed-domains are specified as hostnames
+# (e.g. api.github.com), the policy itself stays in observe-only mode.
+# Actual enforcement is handled by iptables (setup.sh) and monitor.sh for
+# logging and violation reporting.
+#
+# Localhost filtering is done in monitor.sh instead of here because the
+# NotDAddr selector has compatibility issues with some Tetragon versions.
+
+apiVersion: cilium.io/v1alpha1
+kind: TracingPolicy
+metadata:
+  name: network-block
+spec:
+  kprobes:
+    - call: tcp_connect
+      syscall: false
+      args:
+        - index: 0
+          type: sock

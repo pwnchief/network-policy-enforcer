@@ -1,0 +1,177 @@
+#!/bin/sh
+PREFIX="net-enforcer"
+AUDIT_FILE="/tmp/${PREFIX}-audit.json"
+VIOLATIONS_FILE="/tmp/${PREFIX}-violations.json"
+VIOLATION_FLAG="/tmp/${PREFIX}-policy-violation-detected"
+
+# If no audit log exists, nothing happened
+if [ ! -f "$AUDIT_FILE" ]; then
+  echo "No network events recorded."
+  exit 0
+fi
+
+# --- Summary ---
+echo "===== Network Policy Enforcer Report ====="
+
+TOTAL=$(wc -l < "$AUDIT_FILE" | tr -d ' ')
+echo "Total connections observed: $TOTAL"
+
+UNIQUE_DOMAINS=$(jq -r '.destination' "$AUDIT_FILE" | sort -u | wc -l | tr -d ' ')
+echo "Unique destination domains: $UNIQUE_DOMAINS"
+
+if [ "$INPUT_MODE" = "block" ]; then
+  V_COUNT=0
+  [ -f "$VIOLATIONS_FILE" ] && V_COUNT=$(wc -l < "$VIOLATIONS_FILE" | tr -d ' ')
+  echo "Violations (block mode): $V_COUNT"
+fi
+
+echo "==========================================="
+
+# --- Collect iptables-blocked connections from kernel log ---
+IPTABLES_BLOCKS_FILE="/tmp/${PREFIX}-iptables-blocks.json"
+if [ "$INPUT_MODE" = "block" ]; then
+  sudo dmesg 2>/dev/null | grep "NET_ENFORCER_BLOCK:" | awk '{
+    dst=""; dpt=""; proto=""
+    for(i=1;i<=NF;i++) {
+      if($i ~ /^DST=/) dst=substr($i,5)
+      if($i ~ /^DPT=/) dpt=substr($i,5)
+      if($i ~ /^PROTO=/) proto=substr($i,7)
+    }
+    if(dst != "") print dst " " dpt " " proto
+  }' | sort -u | while read -r dst_ip dpt proto; do
+    [ -z "$dst_ip" ] && continue
+    # Resolve IP to hostname via DNS map
+    dst_host="$dst_ip"
+    if [ -f "/tmp/${PREFIX}-dns-map.txt" ]; then
+      mapped=$(grep "^${dst_ip} " "/tmp/${PREFIX}-dns-map.txt" | tail -1 | awk '{print $2}')
+      [ -n "$mapped" ] && dst_host="$mapped"
+    fi
+    jq -cn --arg dst "$dst_host" --arg ip "$dst_ip" --argjson port "${dpt:-0}" --arg proto "${proto:-TCP}" \
+      '{"destination": $dst, "ip": $ip, "port": $port, "proto": $proto, "verdict": "blocked"}'
+  done > "$IPTABLES_BLOCKS_FILE" 2>/dev/null || true
+fi
+
+# All output goes to the Job Summary only -- no annotations.
+
+# --- GitHub Job Summary ---
+if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+  {
+    echo "## Network Policy Enforcer"
+    echo ""
+
+    if [ "$INPUT_MODE" = "block" ]; then
+      # Count all blocked connections (Tetragon + iptables)
+      TETRAGON_VIOLATIONS=0
+      IPTABLES_BLOCKS=0
+      if [ -f "$VIOLATIONS_FILE" ] && [ -s "$VIOLATIONS_FILE" ]; then
+        TETRAGON_VIOLATIONS=$(wc -l < "$VIOLATIONS_FILE" | tr -d ' ')
+      fi
+      if [ -f "$IPTABLES_BLOCKS_FILE" ] && [ -s "$IPTABLES_BLOCKS_FILE" ]; then
+        IPTABLES_BLOCKS=$(wc -l < "$IPTABLES_BLOCKS_FILE" | tr -d ' ')
+      fi
+      TOTAL_BLOCKED=$((TETRAGON_VIOLATIONS + IPTABLES_BLOCKS))
+
+      if [ "$TOTAL_BLOCKED" -gt 0 ]; then
+        echo "> **$TOTAL_BLOCKED blocked connection(s) detected.** The workflow failed because outbound connections were made to disallowed domains."
+      else
+        echo "> All outbound connections were to allowed domains."
+      fi
+
+      # Show iptables-blocked connections (these never reach Tetragon)
+      if [ "$IPTABLES_BLOCKS" -gt 0 ]; then
+        echo ""
+        echo "### Blocked Connections (Firewall)"
+        echo ""
+        echo "| Domain | IP | Port | Protocol |"
+        echo "|--------|----|------|----------|"
+        jq -r '[.destination, .ip, (.port|tostring), .proto] | "| " + join(" | ") + " |"' "$IPTABLES_BLOCKS_FILE"
+      fi
+
+      # Show Tetragon-observed violations
+      if [ "$TETRAGON_VIOLATIONS" -gt 0 ]; then
+        echo ""
+        echo "### Blocked Connections (Monitor)"
+        echo ""
+        echo "| Domain | Port | Binary | Step | PID | Time |"
+        echo "|--------|------|--------|------|-----|------|"
+        jq -r '[.destination, (.port|tostring), .binary, (.step // "unknown"), (.pid|tostring), .timestamp] | "| " + join(" | ") + " |"' "$VIOLATIONS_FILE"
+      fi
+
+      echo ""
+      echo "### Allowed Connections"
+      echo ""
+      echo "| Domain | Port | Binary | Step |"
+      echo "|--------|------|--------|------|"
+      jq -r 'select(.verdict == "allowed") | [.destination, (.port|tostring), .binary, (.step // "unknown")] | "| " + join(" | ") + " |"' "$AUDIT_FILE" | sort -u
+
+    else
+      # Audit mode summary
+      echo "> **Audit mode** — all outbound connections are logged below. No connections were blocked."
+      echo ""
+      echo "### Observed Domains"
+      echo ""
+      echo "| Domain | Port | Binary | Step |"
+      echo "|--------|------|--------|------|"
+      jq -r '[.destination, (.port|tostring), .binary, (.step // "unknown")] | "| " + join(" | ") + " |"' "$AUDIT_FILE" | sort -u
+    fi
+
+    echo ""
+    echo "---"
+    echo "*Total connections: $TOTAL · Unique domains: $UNIQUE_DOMAINS · Mode: $INPUT_MODE*"
+  } >> "$GITHUB_STEP_SUMMARY"
+fi
+
+# --- Generate policy file (audit mode) ---
+if [ "$INPUT_MODE" = "audit" ]; then
+  POLICY_FILE="${INPUT_POLICY_FILE:-network-policy.txt}"
+  # Ensure parent directory exists
+  mkdir -p "$(dirname "$POLICY_FILE")"
+
+  {
+    echo "# Network Policy - generated by Network Policy Enforcer (audit mode)"
+    echo "# Review this list and remove any domains that should not be allowed."
+    echo "# Use with: allowed-domains-file: $POLICY_FILE"
+    echo ""
+    jq -r '.destination' "$AUDIT_FILE" | sort -u
+  } > "$POLICY_FILE"
+
+  DOMAIN_COUNT=$(jq -r '.destination' "$AUDIT_FILE" | sort -u | wc -l | tr -d ' ')
+  echo ":: Generated policy file at ${POLICY_FILE} with ${DOMAIN_COUNT} domains."
+  echo "::notice::Policy file written to ${POLICY_FILE} — commit it and switch to block mode with allowed-domains-file."
+
+  # Add to job summary
+  if [ -n "$GITHUB_STEP_SUMMARY" ]; then
+    {
+      echo ""
+      echo "### Generated Policy File"
+      echo ""
+      echo "A policy file with **${DOMAIN_COUNT} domains** was written to \`${POLICY_FILE}\`."
+      echo "To enforce this policy, commit the file and update your workflow:"
+      echo ""
+      echo '```yaml'
+      echo "- uses: pwnchief/network-policy-enforcer@v1"
+      echo "  with:"
+      echo "    mode: block"
+      echo "    allowed-domains-file: ${POLICY_FILE}"
+      echo '```'
+      echo ""
+      echo "<details>"
+      echo "<summary>Policy file contents</summary>"
+      echo ""
+      echo '```'
+      cat "$POLICY_FILE"
+      echo '```'
+      echo "</details>"
+    } >> "$GITHUB_STEP_SUMMARY"
+  fi
+fi
+
+# --- Reference path ---
+echo "Full audit log: $AUDIT_FILE"
+
+# --- Exit code ---
+if [ -f "$VIOLATION_FLAG" ] && [ "$INPUT_MODE" = "block" ]; then
+  exit 1
+fi
+
+exit 0

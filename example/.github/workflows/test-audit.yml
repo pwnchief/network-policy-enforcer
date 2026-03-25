@@ -1,0 +1,31 @@
+name: "Test Network Policy Enforcer - Audit Mode"
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  audit-test:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Network Policy Enforcer
+        uses: pwnchief/network-policy-enforcer@v1
+        with:
+          mode: audit
+          phase: setup
+
+      - name: Build
+        id: build
+        run: |
+          curl -s https://github.com > /dev/null
+          pip install requests || true
+
+      - name: Report
+        if: always()
+        uses: pwnchief/network-policy-enforcer@v1
+        with:
+          mode: audit
+          phase: report
